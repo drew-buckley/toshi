@@ -1,0 +1,17 @@
+[package]
+name = "toshi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ureq = { version = "3.4", optional = true }
+zip = "9.0.5"
+
+[build-dependencies]
+ureq = { version = "3.4", optional = true }
+
+[features]
+default = ["fetch"]
+fetch = ["dep:ureq"]
+static = ["dep:ureq"]
+ureq = ["dep:ureq"]
