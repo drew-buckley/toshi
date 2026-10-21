@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+cfg-if = "1.0.5"
 ureq = { version = "3.4", optional = true }
 zip = "9.0.5"
 
@@ -13,5 +14,5 @@ ureq = { version = "3.4", optional = true }
 [features]
 default = ["fetch"]
 fetch = ["dep:ureq"]
-static = ["dep:ureq"]
-ureq = ["dep:ureq"]
+static = []
+arc = []

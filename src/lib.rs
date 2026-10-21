@@ -1,9 +1,20 @@
+#[cfg(feature = "static")]
+use std::borrow::Cow;
 use std::{
-    collections::{BTreeMap, VecDeque},
-    io::Cursor,
+    borrow::Cow,
+    collections::BTreeMap,
+    io::{Cursor, Read, Seek},
     str::Lines,
 };
 use zip::ZipArchive;
+
+cfg_if::cfg_if! {
+    if #[cfg(feature = "arc")] {
+        pub type Trc<T> = std::sync::Arc<T>;
+    } else {
+        pub type Trc<T> = std::rc::Rc<T>;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Database {
@@ -33,32 +44,67 @@ impl Database {
     }
 }
 
-impl Database {
-    #[cfg(feature = "static")]
-    fn zip_bytes(self) -> &'static [u8] {
-        match self {
-            Database::Cities500 => embedded::CITIES500,
-            Database::Cities1000 => embedded::CITIES1000,
-            Database::Cities5000 => embedded::CITIES5000,
-            Database::Cities15000 => embedded::CITIES15000,
+cfg_if::cfg_if! {
+    if #[cfg(feature = "static")] {
+        fn zip_bytes(database: Database) -> Result<Cow<'static, [u8]>, error::RetrieveError> {
+            Ok(match database {
+                Database::Cities500 => embedded::CITIES500,
+                Database::Cities1000 => embedded::CITIES1000,
+                Database::Cities5000 => embedded::CITIES5000,
+                Database::Cities15000 => embedded::CITIES15000,
+            }
+            .into())
+        }
+    } else if #[cfg(feature = "fetch")] {
+        fn zip_bytes(database: Database) -> Result<Cow<'static, [u8]>, error::RetrieveError> {
+            let body = ureq::get(format!(
+                "https://download.geonames.org/export/dump/{}.zip",
+                database.name()
+            ))
+            .call().map_err(error::RetrieveError::Fetch)?
+            .into_body();
+
+            let mut buf = Vec::with_capacity(body.content_length().unwrap_or(0) as usize);
+            body.into_reader().read_to_end(&mut buf).map_err(error::RetrieveError::Io)?;
+
+            Ok(buf.into())
+        }
+    }
+}
+
+fn retrieve(database: Database) -> Result<BTreeMap<String, Coordinates>, error::DatabaseError> {
+    let mut zip = ZipArchive::new(Cursor::new(
+        zip_bytes(database).map_err(error::DatabaseError::Retrieval)?,
+    ))
+    .map_err(error::RetrieveError::Zip)
+    .map_err(error::DatabaseError::Retrieval)?;
+    let mut file = zip
+        .by_name(&format!("{}.txt", database.name()))
+        .map_err(error::RetrieveError::Zip)
+        .map_err(error::DatabaseError::Retrieval)?;
+
+    let mut raw = String::with_capacity(file.size() as usize);
+    file.read_to_string(&mut raw)
+        .map_err(error::RetrieveError::Io)
+        .map_err(error::DatabaseError::Retrieval)?;
+
+    let mut parse_errors = Vec::new();
+    let mut cities = BTreeMap::new();
+    for res in raw.lines().map(|l| parse_line(l)) {
+        match res {
+            Ok((name, coordinates)) => {
+                cities.insert(name.to_owned(), coordinates);
+            }
+            Err(err) => {
+                parse_errors.push(err);
+            }
         }
     }
 
-    #[cfg(feature = "static")]
-    pub fn retrieve(self) -> Result<LoadedDatabase, error::DatabaseRetrieveError> {
-        use std::io::Read;
-
-        let mut zip = ZipArchive::new(Cursor::new(self.zip_bytes()))
-            .map_err(error::DatabaseRetrieveError::Zip)?;
-        let mut file = zip
-            .by_name(&format!("{}.txt", self.name()))
-            .map_err(error::DatabaseRetrieveError::Zip)?;
-
-        let mut out = String::with_capacity(file.size() as usize);
-        file.read_to_string(&mut out)
-            .map_err(error::DatabaseRetrieveError::Io)?;
-
-        Ok(LoadedDatabase::new(out, self.city_count()))
+    if parse_errors.is_empty() {
+        Ok(cities)
+    } else {
+        Err(error::DatabaseError::PartialLineParse(cities, parse_errors))
     }
 }
 
@@ -129,7 +175,7 @@ impl<'a> Iterator for CityIterator<'a> {
     type Item = Result<(&'a str, Coordinates), error::LineParseError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.lines.self.lines.next().map(|line| parse_line(line))
+        self.lines.next().map(|line| parse_line(line))
     }
 }
 
@@ -194,20 +240,88 @@ impl std::ops::Sub for Coordinates {
 
 pub mod error {
 
-    use std::num::ParseFloatError;
+    use std::{collections::BTreeMap, num::ParseFloatError};
 
     use zip::result::ZipError;
 
     use super::*;
 
-    pub enum DatabaseRetrieveError {
+    #[derive(Debug)]
+    pub enum DatabaseError {
+        Retrieval(RetrieveError),
+        PartialLineParse(BTreeMap<String, Coordinates>, Vec<LineParseError>),
+    }
+
+    impl std::fmt::Display for DatabaseError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Retrieval(..) => write!(f, "failed to retrieve database bytes"),
+                Self::PartialLineParse(..) => write!(f, "failed parse some or all database lines"),
+            }
+        }
+    }
+
+    impl std::error::Error for DatabaseError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Retrieval(err) => Some(err),
+                Self::PartialLineParse(_, err) => err.first().map(|e| e as &dyn std::error::Error),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub enum RetrieveError {
+        #[cfg(feature = "fetch")]
+        Fetch(ureq::Error),
         Zip(ZipError),
         Io(std::io::Error),
     }
 
+    impl std::fmt::Display for RetrieveError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                #[cfg(feature = "fetch")]
+                Self::Fetch(..) => write!(f, "failed to fetch database"),
+                Self::Zip(..) => write!(f, "failed to extract database"),
+                Self::Io(..) => write!(f, "IO error during database retrieval"),
+            }
+        }
+    }
+
+    impl std::error::Error for RetrieveError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                #[cfg(feature = "fetch")]
+                Self::Fetch(err) => Some(err),
+                Self::Zip(err) => Some(err),
+                Self::Io(err) => Some(err),
+            }
+        }
+    }
+
+    #[derive(Debug)]
     pub enum LineParseError {
         FloatParseError(ParseFloatError),
         LineEndedEarly,
+    }
+
+    impl std::fmt::Display for LineParseError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::FloatParseError(..) => write!(f, "failed to parse float"),
+                Self::LineEndedEarly => write!(f, "line ended early"),
+            }
+        }
+    }
+
+    impl std::error::Error for LineParseError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::FloatParseError(err) => Some(err),
+                Self::LineEndedEarly => None,
+            }
+        }
     }
 }
 
@@ -217,4 +331,17 @@ mod embedded {
     pub const CITIES1000: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cities1000.zip"));
     pub const CITIES5000: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cities5000.zip"));
     pub const CITIES15000: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cities15000.zip"));
+}
+
+mod cache {
+    use std::sync::LazyLock;
+
+    use super::*;
+
+    pub type Cache = LazyLock<Result<BTreeMap<String, Coordinates>, error::DatabaseError>>;
+
+    pub static CITIES500: Cache = LazyLock::new(|| retrieve(Database::Cities500));
+    pub static CITIES1000: Cache = LazyLock::new(|| retrieve(Database::Cities1000));
+    pub static CITIES5000: Cache = LazyLock::new(|| retrieve(Database::Cities5000));
+    pub static CITIES15000: Cache = LazyLock::new(|| retrieve(Database::Cities15000));
 }
