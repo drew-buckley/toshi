@@ -1,62 +1,132 @@
-#[cfg(feature = "static")]
+use ordered_float::OrderedFloat;
 use std::borrow::Cow;
 use std::{
-    borrow::Cow,
     collections::BTreeMap,
-    io::{Cursor, Read, Seek},
-    str::Lines,
+    io::{Cursor, Read},
 };
 use zip::ZipArchive;
 
-cfg_if::cfg_if! {
-    if #[cfg(feature = "arc")] {
-        pub type Trc<T> = std::sync::Arc<T>;
-    } else {
-        pub type Trc<T> = std::rc::Rc<T>;
+pub struct Database {
+    inner: BTreeMap<String, Coordinates>,
+}
+
+impl Database {
+    fn new(inner: BTreeMap<String, Coordinates>) -> Self {
+        Self { inner }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, Coordinates)> {
+        self.inner.iter().map(|(s, c)| (s.as_str(), *c))
+    }
+
+    pub fn get(&self, city: impl AsRef<str>) -> Option<Coordinates> {
+        self.inner.get(city.as_ref()).copied()
+    }
+
+    pub fn into_btree_map(self) -> BTreeMap<String, Coordinates> {
+        self.inner
+    }
+
+    pub fn calculate_proximities(
+        &self,
+        city: impl AsRef<str>,
+    ) -> Option<BTreeMap<OrderedFloat<f32>, &str>> {
+        self.inner.get(city.as_ref()).copied().map(|target| {
+            self.inner
+                .iter()
+                .map(|(n, c)| ((target - *c).magnitude().into(), n.as_str()))
+                .collect()
+        })
+    }
+}
+
+impl IntoIterator for Database {
+    type IntoIter = std::collections::btree_map::IntoIter<String, Coordinates>;
+    type Item = (String, Coordinates);
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.into_iter()
+    }
+}
+
+impl From<Database> for BTreeMap<String, Coordinates> {
+    fn from(db: Database) -> Self {
+        db.into_btree_map()
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Database {
+pub enum DatabaseId {
     Cities500,
     Cities1000,
     Cities5000,
     Cities15000,
 }
 
-impl Database {
+impl DatabaseId {
     const fn name(self) -> &'static str {
         match self {
-            Database::Cities500 => "cities500",
-            Database::Cities1000 => "cities1000",
-            Database::Cities5000 => "cities5000",
-            Database::Cities15000 => "cities15000",
+            DatabaseId::Cities500 => "cities500",
+            DatabaseId::Cities1000 => "cities1000",
+            DatabaseId::Cities5000 => "cities5000",
+            DatabaseId::Cities15000 => "cities15000",
         }
     }
 
-    const fn city_count(self) -> usize {
+    pub const fn city_count(self) -> usize {
         match self {
-            Database::Cities500 => 500,
-            Database::Cities1000 => 1000,
-            Database::Cities5000 => 5000,
-            Database::Cities15000 => 15000,
+            DatabaseId::Cities500 => 500,
+            DatabaseId::Cities1000 => 1000,
+            DatabaseId::Cities5000 => 5000,
+            DatabaseId::Cities15000 => 15000,
         }
     }
 }
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "static")] {
-        fn zip_bytes(database: Database) -> Result<Cow<'static, [u8]>, error::RetrieveError> {
+        pub fn cities(
+            database: DatabaseId,
+        ) -> Result<&'static Database, &'static error::DatabaseError> {
+            match database {
+                DatabaseId::Cities500 => &static_cache::CITIES500,
+                DatabaseId::Cities1000 => &static_cache::CITIES1000,
+                DatabaseId::Cities5000 => &static_cache::CITIES5000,
+                DatabaseId::Cities15000 => &static_cache::CITIES15000,
+            }
+            .as_ref()
+        }
+
+        fn zip_bytes(database: DatabaseId) -> Result<Cow<'static, [u8]>, error::RetrieveError> {
             Ok(match database {
-                Database::Cities500 => embedded::CITIES500,
-                Database::Cities1000 => embedded::CITIES1000,
-                Database::Cities5000 => embedded::CITIES5000,
-                Database::Cities15000 => embedded::CITIES15000,
+                DatabaseId::Cities500 => embedded::CITIES500,
+                DatabaseId::Cities1000 => embedded::CITIES1000,
+                DatabaseId::Cities5000 => embedded::CITIES5000,
+                DatabaseId::Cities15000 => embedded::CITIES15000,
             }
             .into())
         }
     } else if #[cfg(feature = "fetch")] {
-        fn zip_bytes(database: Database) -> Result<Cow<'static, [u8]>, error::RetrieveError> {
+        pub fn fetch_cities(
+            database: DatabaseId,
+        ) -> Result<Arc<Database>, error::DatabaseError> {
+            let mut cache = match database {
+                DatabaseId::Cities500 => &fetch_cache::CITIES500,
+                DatabaseId::Cities1000 => &fetch_cache::CITIES1000,
+                DatabaseId::Cities5000 => &fetch_cache::CITIES5000,
+                DatabaseId::Cities15000 => &fetch_cache::CITIES15000,
+            }.lock();
+
+            if let Some(cache) = cache.clone() {
+                Ok(cache)
+            } else {
+                let db = Arc::new(retrieve(database)?);
+                *cache = Some(db.clone());
+                Ok(db)
+            }
+        }
+
+        fn zip_bytes(database: DatabaseId) -> Result<Cow<'static, [u8]>, error::RetrieveError> {
             let body = ureq::get(format!(
                 "https://download.geonames.org/export/dump/{}.zip",
                 database.name()
@@ -72,7 +142,7 @@ cfg_if::cfg_if! {
     }
 }
 
-fn retrieve(database: Database) -> Result<BTreeMap<String, Coordinates>, error::DatabaseError> {
+fn retrieve(database: DatabaseId) -> Result<Database, error::DatabaseError> {
     let mut zip = ZipArchive::new(Cursor::new(
         zip_bytes(database).map_err(error::DatabaseError::Retrieval)?,
     ))
@@ -102,80 +172,9 @@ fn retrieve(database: Database) -> Result<BTreeMap<String, Coordinates>, error::
     }
 
     if parse_errors.is_empty() {
-        Ok(cities)
+        Ok(Database::new(cities))
     } else {
         Err(error::DatabaseError::PartialLineParse(cities, parse_errors))
-    }
-}
-
-pub struct LoadedDatabase {
-    text: String,
-    city_count: usize,
-}
-
-impl LoadedDatabase {
-    fn new(text: String, city_count: usize) -> Self {
-        Self { text, city_count }
-    }
-
-    pub fn iter(&self) -> CityIterator<'_> {
-        CityIterator::new(&self.text)
-    }
-
-    pub fn find_nearby_cities(
-        &self,
-        target_city: impl AsRef<str>,
-        radius: f32,
-    ) -> Option<((&str, Coordinates), Vec<(&str, Coordinates)>)> {
-        let target_city = target_city.as_ref();
-        let mut backbuf = Vec::with_capacity(self.city_count);
-        let mut nearby = Vec::new();
-        let mut target = None;
-        for (city, coordinates) in self.iter().filter_map(|r| r.ok()) {
-            if let Some((_, target_coordinates)) = target {
-                let delta: CoordinateDelta = target_coordinates - coordinates;
-                if delta.magnitude() <= radius {
-                    nearby.push((city, coordinates));
-                }
-            } else {
-                if city.eq_ignore_ascii_case(target_city) {
-                    target = Some((city, coordinates));
-                } else {
-                    backbuf.push((city, coordinates));
-                }
-            }
-        }
-
-        let Some((target_city, target_coordinates)) = target else {
-            return None;
-        };
-        for (city, coordinates) in backbuf {
-            let delta: CoordinateDelta = target_coordinates - coordinates;
-            if delta.magnitude() <= radius {
-                nearby.push((city, coordinates));
-            }
-        }
-        Some(((target_city, target_coordinates), nearby))
-    }
-}
-
-pub struct CityIterator<'a> {
-    lines: Lines<'a>,
-}
-
-impl<'a> CityIterator<'a> {
-    fn new(text: &'a str) -> Self {
-        Self {
-            lines: text.lines(),
-        }
-    }
-}
-
-impl<'a> Iterator for CityIterator<'a> {
-    type Item = Result<(&'a str, Coordinates), error::LineParseError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.lines.next().map(|line| parse_line(line))
     }
 }
 
@@ -327,21 +326,38 @@ pub mod error {
 
 #[cfg(feature = "static")]
 mod embedded {
-    pub const CITIES500: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cities500.zip"));
-    pub const CITIES1000: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cities1000.zip"));
-    pub const CITIES5000: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cities5000.zip"));
-    pub const CITIES15000: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cities15000.zip"));
+    pub const CITIES500: &[u8] = include_bytes!("assets/cities500.zip");
+    pub const CITIES1000: &[u8] = include_bytes!("assets/cities1000.zip");
+    pub const CITIES5000: &[u8] = include_bytes!("assets/cities5000.zip");
+    pub const CITIES15000: &[u8] = include_bytes!("assets/cities15000.zip");
 }
 
-mod cache {
+#[cfg(feature = "static")]
+mod static_cache {
     use std::sync::LazyLock;
 
     use super::*;
 
-    pub type Cache = LazyLock<Result<BTreeMap<String, Coordinates>, error::DatabaseError>>;
+    pub type Cache = LazyLock<Result<Database, error::DatabaseError>>;
 
-    pub static CITIES500: Cache = LazyLock::new(|| retrieve(Database::Cities500));
-    pub static CITIES1000: Cache = LazyLock::new(|| retrieve(Database::Cities1000));
-    pub static CITIES5000: Cache = LazyLock::new(|| retrieve(Database::Cities5000));
-    pub static CITIES15000: Cache = LazyLock::new(|| retrieve(Database::Cities15000));
+    pub static CITIES500: Cache = LazyLock::new(|| retrieve(DatabaseId::Cities500));
+    pub static CITIES1000: Cache = LazyLock::new(|| retrieve(DatabaseId::Cities1000));
+    pub static CITIES5000: Cache = LazyLock::new(|| retrieve(DatabaseId::Cities5000));
+    pub static CITIES15000: Cache = LazyLock::new(|| retrieve(DatabaseId::Cities15000));
+}
+
+#[cfg(feature = "fetch")]
+mod fetch_cache {
+    use std::sync::{Arc, LazyLock};
+
+    use parking_lot::Mutex;
+
+    use super::*;
+
+    pub type Cache = LazyLock<Mutex<Option<Arc<Database>>>>;
+
+    pub static CITIES500: Cache = LazyLock::new(|| Mutex::new(None));
+    pub static CITIES1000: Cache = LazyLock::new(|| Mutex::new(None));
+    pub static CITIES5000: Cache = LazyLock::new(|| Mutex::new(None));
+    pub static CITIES15000: Cache = LazyLock::new(|| Mutex::new(None));
 }
