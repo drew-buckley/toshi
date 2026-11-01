@@ -225,7 +225,7 @@ fn parse_line(line: &str) -> Result<(City, Coordinates), error::LineParseError> 
         .map_err(error::LineParseError::FloatParseError)?;
 
     let country_code: [u8; 2] = it
-        .nth(3)
+        .nth(2)
         .ok_or(error::LineParseError::LineEndedEarly)?
         .as_bytes()
         .try_into()
