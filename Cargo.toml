@@ -7,6 +7,7 @@ edition = "2024"
 cfg-if = "1.0.5"
 ordered-float = "5.5.0"
 parking_lot = "0.13.0"
+smol_str = "0.3.7"
 ureq = { version = "3.4", optional = true }
 zip = "9.0.5"
 

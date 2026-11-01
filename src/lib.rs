@@ -1,4 +1,5 @@
 use ordered_float::OrderedFloat;
+use smol_str::SmolStr;
 use std::borrow::Cow;
 use std::{
     collections::BTreeMap,
@@ -6,50 +7,81 @@ use std::{
 };
 use zip::ZipArchive;
 
+#[derive(Debug, Clone, Hash, PartialOrd, Ord, PartialEq, Eq)]
+pub struct City {
+    name: SmolStr,
+    country_code: [u8; 2],
+}
+
+impl City {
+    pub fn try_new(name: impl Into<SmolStr>, country_code: impl AsRef<str>) -> Option<Self> {
+        let country_code = country_code.as_ref().as_bytes();
+        if let Ok(country_code) = country_code.try_into() {
+            Some(Self::new(name, country_code))
+        } else {
+            None
+        }
+    }
+
+    fn new(name: impl Into<SmolStr>, country_code: [u8; 2]) -> Self {
+        debug_assert!(std::str::from_utf8(&country_code).is_ok());
+        Self {
+            name: name.into(),
+            country_code,
+        }
+    }
+
+    pub fn name(&self) -> impl AsRef<str> {
+        &self.name
+    }
+
+    pub fn country_code(&self) -> &str {
+        // safe to unwrap; prevalidated
+        std::str::from_utf8(&self.country_code).unwrap()
+    }
+}
+
 pub struct Database {
-    inner: BTreeMap<String, Coordinates>,
+    inner: BTreeMap<City, Coordinates>,
 }
 
 impl Database {
-    fn new(inner: BTreeMap<String, Coordinates>) -> Self {
+    fn new(inner: BTreeMap<City, Coordinates>) -> Self {
         Self { inner }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&str, Coordinates)> {
-        self.inner.iter().map(|(s, c)| (s.as_str(), *c))
+    pub fn iter(&self) -> impl Iterator<Item = (&City, Coordinates)> {
+        self.inner.iter().map(|(s, c)| (s, *c))
     }
 
-    pub fn get(&self, city: impl AsRef<str>) -> Option<Coordinates> {
-        self.inner.get(city.as_ref()).copied()
+    pub fn get(&self, city: &City) -> Option<Coordinates> {
+        self.inner.get(city).copied()
     }
 
-    pub fn into_btree_map(self) -> BTreeMap<String, Coordinates> {
+    pub fn into_btree_map(self) -> BTreeMap<City, Coordinates> {
         self.inner
     }
 
-    pub fn calculate_proximities(
-        &self,
-        city: impl AsRef<str>,
-    ) -> Option<BTreeMap<OrderedFloat<f32>, &str>> {
-        self.inner.get(city.as_ref()).copied().map(|target| {
+    pub fn calculate_proximities(&self, city: &City) -> Option<BTreeMap<OrderedFloat<f32>, &City>> {
+        self.inner.get(&city).copied().map(|target| {
             self.inner
                 .iter()
-                .map(|(n, c)| ((target - *c).magnitude().into(), n.as_str()))
+                .map(|(n, c)| ((target - *c).magnitude().into(), n))
                 .collect()
         })
     }
 }
 
 impl IntoIterator for Database {
-    type IntoIter = std::collections::btree_map::IntoIter<String, Coordinates>;
-    type Item = (String, Coordinates);
+    type IntoIter = std::collections::btree_map::IntoIter<City, Coordinates>;
+    type Item = (City, Coordinates);
 
     fn into_iter(self) -> Self::IntoIter {
         self.inner.into_iter()
     }
 }
 
-impl From<Database> for BTreeMap<String, Coordinates> {
+impl From<Database> for BTreeMap<City, Coordinates> {
     fn from(db: Database) -> Self {
         db.into_btree_map()
     }
@@ -109,7 +141,7 @@ cfg_if::cfg_if! {
     } else if #[cfg(feature = "fetch")] {
         pub fn fetch_cities(
             database: DatabaseId,
-        ) -> Result<Arc<Database>, error::DatabaseError> {
+        ) -> Result<std::sync::Arc<Database>, error::DatabaseError> {
             let mut cache = match database {
                 DatabaseId::Cities500 => &fetch_cache::CITIES500,
                 DatabaseId::Cities1000 => &fetch_cache::CITIES1000,
@@ -120,7 +152,7 @@ cfg_if::cfg_if! {
             if let Some(cache) = cache.clone() {
                 Ok(cache)
             } else {
-                let db = Arc::new(retrieve(database)?);
+                let db = std::sync::Arc::new(retrieve(database)?);
                 *cache = Some(db.clone());
                 Ok(db)
             }
@@ -178,7 +210,7 @@ fn retrieve(database: DatabaseId) -> Result<Database, error::DatabaseError> {
     }
 }
 
-fn parse_line(line: &str) -> Result<(&str, Coordinates), error::LineParseError> {
+fn parse_line(line: &str) -> Result<(City, Coordinates), error::LineParseError> {
     let mut it = line.split('\t');
     let name = it.nth(1).ok_or(error::LineParseError::LineEndedEarly)?;
     let latitude: f32 = it
@@ -192,7 +224,17 @@ fn parse_line(line: &str) -> Result<(&str, Coordinates), error::LineParseError> 
         .parse()
         .map_err(error::LineParseError::FloatParseError)?;
 
-    Ok((name, Coordinates::new(latitude, longitude)))
+    let country_code: [u8; 2] = it
+        .nth(3)
+        .ok_or(error::LineParseError::LineEndedEarly)?
+        .as_bytes()
+        .try_into()
+        .map_err(|_| error::LineParseError::CountryCodeBadSize)?;
+
+    Ok((
+        City::new(name, country_code),
+        Coordinates::new(latitude, longitude),
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -248,7 +290,7 @@ pub mod error {
     #[derive(Debug)]
     pub enum DatabaseError {
         Retrieval(RetrieveError),
-        PartialLineParse(BTreeMap<String, Coordinates>, Vec<LineParseError>),
+        PartialLineParse(BTreeMap<City, Coordinates>, Vec<LineParseError>),
     }
 
     impl std::fmt::Display for DatabaseError {
@@ -302,6 +344,7 @@ pub mod error {
     #[derive(Debug)]
     pub enum LineParseError {
         FloatParseError(ParseFloatError),
+        CountryCodeBadSize,
         LineEndedEarly,
     }
 
@@ -309,6 +352,7 @@ pub mod error {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 Self::FloatParseError(..) => write!(f, "failed to parse float"),
+                Self::CountryCodeBadSize => write!(f, "country code must be 2 bytes"),
                 Self::LineEndedEarly => write!(f, "line ended early"),
             }
         }
@@ -318,7 +362,7 @@ pub mod error {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             match self {
                 Self::FloatParseError(err) => Some(err),
-                Self::LineEndedEarly => None,
+                Self::CountryCodeBadSize | Self::LineEndedEarly => None,
             }
         }
     }
